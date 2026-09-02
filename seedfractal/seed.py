@@ -1,11 +1,9 @@
 """
-Variable-width hierarchical Seed.
+Variable-width hierarchical Seed – still pure extract/deposit.
 
-A seed is a packed record:
-  [ addressing | payload | child_ref | optional extra fields... ]
-
-Layout is itself described by a small header so different seeds
-can have different widths. All access remains pure bit extract/deposit.
+Layout fields are treated as compile-time constants wherever possible
+so that offset calculations fold into immediate shifts/adds and the
+generated code stays branch-free.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ class SeedLayout:
     addressing_bits: int = 32
     payload_bits: int = 32
     child_ref_bits: int = 32
-    extra_bits: int = 0  # for future holographic / mask data
+    extra_bits: int = 0
 
     @property
     def total_bits(self) -> int:
@@ -34,8 +32,6 @@ class SeedLayout:
         )
 
     def pack(self) -> int:
-        """Pack layout descriptor into 32 bits for storage."""
-        # 8 bits each for the four fields (max 255)
         return (
             (self.addressing_bits & 0xFF)
             | ((self.payload_bits & 0xFF) << 8)
@@ -53,7 +49,8 @@ class SeedLayout:
         )
 
 
-DEFAULT_LAYOUT = SeedLayout()
+# Prefer power-of-two total sizes for nicest alignment and indexing
+DEFAULT_LAYOUT = SeedLayout(32, 32, 32, 0)  # 96 bits → allocated as 128
 
 
 class Seed:
@@ -69,9 +66,8 @@ class Seed:
         self.bit_offset = bit_offset
         self.layout = layout
 
-    # ---- zero-cost field access ----
-
     def _off(self, field: str) -> int:
+        # Straight-line offset calculation; field is normally a constant
         o = self.bit_offset
         if field == "addressing":
             return o
@@ -82,7 +78,7 @@ class Seed:
         if field == "child_ref":
             return o
         o += self.layout.child_ref_bits
-        return o  # extra
+        return o
 
     def addressing(self) -> int:
         return self.arena.read_bits(self._off("addressing"), self.layout.addressing_bits)
@@ -103,24 +99,23 @@ class Seed:
         self.arena.write_bits(self._off("child_ref"), self.layout.child_ref_bits, relative)
 
     def extra(self) -> int:
-        if self.layout.extra_bits == 0:
-            return 0
-        return self.arena.read_bits(self._off("extra"), self.layout.extra_bits)
+        return self.arena.read_bits(self._off("extra"), max(1, self.layout.extra_bits))
 
     def set_extra(self, v: int) -> None:
-        if self.layout.extra_bits:
+        if self.layout.extra_bits:  # constant in specialised kernels
             self.arena.write_bits(self._off("extra"), self.layout.extra_bits, v)
 
     def child(self) -> Optional["Seed"]:
         rel = self.child_ref()
+        # Branchless "return None if rel==0 else Seed(...)"
+        # In the prototype we still use a Python conditional for the
+        # Optional return type; a C lowering would return a sentinel offset.
         if rel == 0:
             return None
-        # child may have a different layout; for now we inherit
         return Seed(self.arena, self.bit_offset + rel, self.layout)
 
     def __repr__(self) -> str:
         return (
             f"Seed(@{self.bit_offset}, addr={self.addressing():#x}, "
-            f"pay={self.payload():#x}, child={self.child_ref()}, "
-            f"layout={self.layout.total_bits}b)"
+            f"pay={self.payload():#x}, child={self.child_ref()})"
         )
