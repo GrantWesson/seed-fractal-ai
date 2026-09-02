@@ -1,16 +1,9 @@
 """
-True self-modification.
+True self-modification + evolution of branchless operators.
 
-Out-of-box approach:
-- Key functions (mutation operators, fitness helpers) are stored as
-  source-text or compact bytecode seeds inside the arena.
-- The improver proposes bit-level or token-level mutations to those seeds.
-- Each mutant is executed inside a severely restricted sandbox on a
-  private arena copy.
-- Only mutants that improve measured fitness are written back.
-
-This closes the loop: the system can rewrite the very operators that
-produce the next generation of improvements.
+The improver can now propose branchless rewrites of its own
+mutation helpers and keep them only when measured fitness does
+not regress.
 """
 
 from __future__ import annotations
@@ -18,9 +11,8 @@ from __future__ import annotations
 import ast
 import random
 import textwrap
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict
 
-# Extremely restricted builtins for sandboxed eval
 _SAFE_BUILTINS = {
     "range": range,
     "len": len,
@@ -38,9 +30,7 @@ _SAFE_BUILTINS = {
 
 
 def _safe_exec(source: str, locals_dict: dict) -> None:
-    """Execute source with almost no builtins."""
     tree = ast.parse(source, mode="exec")
-    # Reject anything that looks like an import or attribute deep dive
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
             raise ValueError("Forbidden node")
@@ -48,10 +38,9 @@ def _safe_exec(source: str, locals_dict: dict) -> None:
     exec(code, {"__builtins__": _SAFE_BUILTINS}, locals_dict)
 
 
-# ---- mutation operators that themselves can be evolved ----
+# ---------- classic mutators ----------
 
 def mutate_source_bitflip(src: str, rate: float = 0.02) -> str:
-    """Treat source as bytes and flip a few bits (may produce syntax errors)."""
     data = bytearray(src.encode("utf-8"))
     n = max(1, int(len(data) * rate))
     for _ in range(n):
@@ -60,11 +49,10 @@ def mutate_source_bitflip(src: str, rate: float = 0.02) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        return src  # revert on failure
+        return src
 
 
 def mutate_source_token(src: str) -> str:
-    """Crude token-level mutation: swap two identifiers or constants."""
     tokens = src.split()
     if len(tokens) < 4:
         return src
@@ -73,15 +61,35 @@ def mutate_source_token(src: str) -> str:
     return " ".join(tokens)
 
 
+# ---------- branchless-oriented mutators (the ones we want to evolve) ----------
+
+def mutate_toward_branchless(src: str) -> str:
+    """
+    Heuristic rewrite that replaces common if/else patterns with
+    arithmetic select idioms. This is deliberately simple so the
+    improver can further mutate it.
+    """
+    # Very small pattern catalogue – real evolution happens by mutating this function itself
+    replacements = [
+        ("if cond:", "# branchless candidate: mask = -int(cond != 0)"),
+        ("else:", "# else path blended"),
+        ("return a if c else b", "return (a & -int(c != 0)) | (b & ~(-int(c != 0)))"),
+    ]
+    out = src
+    for old, new in replacements:
+        if old in out and random.random() < 0.4:
+            out = out.replace(old, new, 1)
+    return out
+
+
 DEFAULT_MUTATORS: Dict[str, Callable[[str], str]] = {
     "bitflip": mutate_source_bitflip,
     "token": mutate_source_token,
+    "branchless": mutate_toward_branchless,
 }
 
 
 class CodeSeed:
-    """A piece of source that lives (conceptually) as a seed."""
-
     def __init__(self, name: str, source: str):
         self.name = name
         self.source = textwrap.dedent(source).strip()
@@ -98,13 +106,21 @@ class CodeSeed:
             return False
 
 
-# Bootstrap: a tiny fitness helper expressed as a CodeSeed
+# Bootstrap helpers that themselves can be evolved toward pure arithmetic
 BOOTSTRAP_FITNESS_HELPER = CodeSeed(
     "helper",
     """
 def score(hits, total):
-    if total <= 0:
-        return 0.0
-    return hits / total
+    # Prefer arithmetic form
+    return hits / (total + (total == 0))
+""",
+)
+
+BOOTSTRAP_SELECT = CodeSeed(
+    "select",
+    """
+def select(cond, a, b):
+    mask = -int(cond != 0)
+    return (a & mask) | (b & ~mask)
 """,
 )

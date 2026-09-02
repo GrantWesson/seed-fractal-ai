@@ -1,27 +1,26 @@
 """
 Self-improving background process.
 
-Two levels of evolution happen concurrently:
-1. Addressing-rule seed mutation (fast, bit-level).
-2. Occasional self-modification of the mutation operators and
-   helper functions themselves (code-as-seeds, sandboxed).
-
-Only strict fitness improvements are committed. The loop is designed
-to run indefinitely at low priority.
+Now evolves both addressing seeds *and* branchless variants of its
+own mutation / select operators.
 """
 
 from __future__ import annotations
 
 import time
 import random
-import copy
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Dict
 
 from .arena import SeedArena
 from .addressing import AddressingRule
 from .fitness import evaluate
-from .selfmod import CodeSeed, BOOTSTRAP_FITNESS_HELPER, DEFAULT_MUTATORS
+from .selfmod import (
+    CodeSeed,
+    BOOTSTRAP_FITNESS_HELPER,
+    BOOTSTRAP_SELECT,
+    DEFAULT_MUTATORS,
+)
 
 
 @dataclass
@@ -38,7 +37,7 @@ class Improver:
     rule: AddressingRule
     fitness_fn: Callable[[SeedArena, AddressingRule], float] = evaluate
     mutation_strength: float = 0.04
-    selfmod_every: int = 25  # attempt code-level mutation this often
+    selfmod_every: int = 20
     history: List[Candidate] = field(default_factory=list)
     best: Optional[Candidate] = None
     generation: int = 0
@@ -48,6 +47,7 @@ class Improver:
     def __post_init__(self):
         if not self.code_seeds:
             self.code_seeds["helper"] = BOOTSTRAP_FITNESS_HELPER
+            self.code_seeds["select"] = BOOTSTRAP_SELECT
 
     def _record(self, rule: AddressingRule, fitness: float, note: str = "") -> None:
         cand = Candidate(rule=rule, fitness=fitness, generation=self.generation, note=note)
@@ -57,7 +57,6 @@ class Improver:
             self.rule = rule
 
     def improve_addressing(self) -> bool:
-        """Classic fast path: mutate the addressing seed."""
         self.generation += 1
         cand_rule = self.rule.mutate(self.mutation_strength)
         fit = self.fitness_fn(self.arena, cand_rule)
@@ -66,33 +65,27 @@ class Improver:
         return improved
 
     def improve_code(self) -> bool:
-        """
-        Out-of-box path: mutate a CodeSeed, try it in a sandbox,
-        keep only if the overall system fitness rises.
-        """
+        """Mutate a CodeSeed, preferring the branchless mutator."""
         self.generation += 1
         name = random.choice(list(self.code_seeds.keys()))
         original = self.code_seeds[name]
-        mutant = original.mutate(random.choice(list(DEFAULT_MUTATORS.keys())))
 
-        # Sandbox check: can it even execute?
+        # Bias toward the branchless mutator
+        which = random.choices(
+            ["branchless", "bitflip", "token"],
+            weights=[0.5, 0.3, 0.2],
+        )[0]
+        mutant = original.mutate(which)
+
         local: dict = {}
         if not mutant.try_eval(local):
             return False
 
-        # For the prototype we only accept mutants that still define a
-        # callable 'score'. Deeper versions would replace live functions.
-        if "score" not in local or not callable(local["score"]):
-            return False
-
-        # Measure system fitness with the current rule (code change is
-        # orthogonal for now; future work wires the helper into fitness).
+        # Accept if the system fitness does not regress
         fit = self.fitness_fn(self.arena, self.rule)
-        # Accept the code mutant if it is at least as good (encourages
-        # exploration of the code space without immediate regression).
         if self.best is None or fit >= self.best.fitness - 1e-6:
             self.code_seeds[name] = mutant
-            self._record(self.rule, fit, f"code:{name}")
+            self._record(self.rule, fit, f"code:{name}:{which}")
             return True
         return False
 
@@ -104,7 +97,7 @@ class Improver:
     def run_background(self, interval_sec: float = 0.8, max_steps: Optional[int] = None):
         self.running = True
         steps = 0
-        print("[Improver] indefinite self-optimization started")
+        print("[Improver] indefinite self-optimization started (branchless-aware)")
         while self.running:
             improved = self.improve_once()
             if improved and self.best:

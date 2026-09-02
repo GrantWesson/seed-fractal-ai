@@ -2,10 +2,10 @@
 Seed-Fractal AI
 ---------------
 Nested bidirectional seeds. Zero unpack. Zero data-dependent branches.
-Continuous self-modification.
+Power-of-two layouts. Continuous self-modification (including of branchless operators).
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .arena import SeedArena
 from .seed import Seed, SeedLayout
