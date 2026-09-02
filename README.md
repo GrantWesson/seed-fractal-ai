@@ -1,56 +1,54 @@
 # Seed-Fractal AI
 
-**Self-improving, bit-packed, nested-seed fractal intelligence.**
+**Pure unadulterated optimization. Nested bidirectional seeds. Zero unpack. Self-modifying forever.**
 
-The entire model is a single contiguous, perfectly aligned arena of **seeds within seeds**.
+The model *is* a single contiguous, perfectly aligned packed-bit arena of seeds-within-seeds.
 
-- A *question* is a seed.
-- That seed *is* the address of its answer.
-- The answer is itself a seed that points back.
-- No expansion, no unpacking, no materialization.
-- Lookups are pure bit-permutes + aligned loads.
+- Question bits **are** the address of the answer seed.
+- Answer seed points back (involution).
+- No expansion. No materialization. No temporary unpacked values.
+- Every load/store is word-aligned; residual bits live in carry state that is itself aligned.
+- Hierarchy = relative bit offsets only.
+- The system rewrites its own functions by treating code fragments as seeds, simulating mutations, and keeping only measured improvements. This runs indefinitely as a background process.
 
-The system continuously improves its own functions by running background simulations of candidate changes and keeping only those that measure better. This loop runs indefinitely as a low-priority process.
+Goal: capable general intelligence inside **≤ 2048 MiB** through radical representation and continuous self-optimization.
 
-Target: useful general capability inside **≤ 2048 MiB**.
+## Out-of-the-box principles
 
-## Core Ideas
-
-1. **Bidirectional nested seeds**  
-   Question ↔ Answer is an involution realized by bit-level addressing rules. No depth unrolling.
-
-2. **Zero-cost packed representation**  
-   Everything stays in a packed bit-arena. Extract / deposit / lookup are shifts, masks, and aligned vector loads only.
-
-3. **Self-modification**  
-   A background `Improver` mutates addressing rules or payloads, runs cheap simulations, and commits improvements.
-
-4. **Fractal hierarchy without expansion**  
-   Seeds contain child-seed references (bit offsets). Hierarchy is pure addressing, never materialised tensors.
+1. **Never unpack** – the packed stream is the native form. Extract/deposit are pure shifts + masks.
+2. **Addressing is computation** – involutive / holographic / binding operations turn questions into offsets with only bit ops.
+3. **Code is data is seeds** – the improver stores mutation operators and fitness functions as packed seeds and evolves them.
+4. **Simulation before commit** – every candidate change is measured on a task suite; only strict improvement is kept.
+5. **Hierarchy without growth** – child seeds are bit-offset references; depth is addressing, not allocation of dense tensors.
+6. **Persistence is the arena itself** – save/load is a single contiguous buffer dump.
 
 ## Quick Start
 
 ```bash
+git clone https://github.com/GrantWesson/seed-fractal-ai.git
+cd seed-fractal-ai
 pip install -e .
 python -m seedfractal.demo
 ```
 
-## Project Layout
+## Architecture
 
 ```
 seedfractal/
-  arena.py          # SeedArena – the single packed bit buffer
-  seed.py           # Seed view (zero-copy)
-  addressing.py     # Involutive / learned bit-permute addressing
-  kernels.py        # Fused packed operations
-  improver.py       # Background self-improvement loop
-  runtime.py        # Tiny runtime + simulation harness
-demo.py             # Minimal working example
+  arena.py          # Packed uint64 arena + persistence
+  seed.py           # Variable-width hierarchical Seed view
+  addressing.py     # Involutive + holographic binding rules
+  kernels.py        # Zero-cost lookup / deposit / step
+  fitness.py        # Multi-task evaluation suite
+  improver.py       # Self-modifying background optimizer
+  selfmod.py        # Code-as-seeds, AST/bit mutation, sandboxed eval
+  runtime.py        # Orchestrator + daemon
+  demo.py           # End-to-end demonstration
 ```
 
 ## Status
 
-Research prototype. The Python layer is the executable specification of the ideas. Later stages will lower the hot kernels to C++/CUDA/bit-intrinsics and eventually to a custom bit-stream ISA.
+Executable research prototype. Python is the specification language. Hot paths are written so they can be lowered later to C++/CUDA/bit-intrinsics or a custom bit-stream ISA without changing semantics.
 
 ## License
 

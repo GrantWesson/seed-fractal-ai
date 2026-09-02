@@ -1,39 +1,46 @@
 """
-Fused packed kernels. Everything stays in the bit domain.
+Fused packed kernels. The only operations that ever touch the arena.
 """
 
 from __future__ import annotations
 
 from .arena import SeedArena
-from .seed import Seed
+from .seed import Seed, SeedLayout, DEFAULT_LAYOUT
 from .addressing import AddressingRule
 
 
-def lookup(arena: SeedArena, question: int, rule: AddressingRule) -> Seed:
-    """
-    The fundamental operation:
-        question → address → seed (already aligned, already the answer)
-    Cost: a few bit ops + one aligned load.
-    """
+def lookup(arena: SeedArena, question: int, rule: AddressingRule, layout: SeedLayout = DEFAULT_LAYOUT) -> Seed:
     addr = rule(question)
-    return Seed(arena, addr)
+    return Seed(arena, addr, layout)
 
 
-def deposit_answer(arena: SeedArena, question: int, answer_payload: int, rule: AddressingRule) -> Seed:
-    """Write an answer seed at the location the question points to."""
+def deposit(
+    arena: SeedArena,
+    question: int,
+    payload: int,
+    rule: AddressingRule,
+    layout: SeedLayout = DEFAULT_LAYOUT,
+    child_rel: int = 0,
+    extra: int = 0,
+) -> Seed:
     addr = rule(question)
-    # Ensure the slot exists (bump if necessary – toy version)
-    if addr + 96 > arena.next_free_bit:  # rough size check
-        # For the prototype we just force the allocator forward
-        arena.next_free_bit = max(arena.next_free_bit, addr + 128)
-    s = Seed(arena, addr)
-    s.set_addressing(question)          # store the question so we can walk back
-    s.set_payload(answer_payload)
-    s.set_child_ref(0)
+    need = layout.total_bits
+    # ensure space (toy bump)
+    if addr + need > arena.next_free_bit:
+        arena.next_free_bit = max(arena.next_free_bit, addr + need + 64)
+        arena.buf[3] = np.uint64(arena.next_free_bit)  # type: ignore
+    s = Seed(arena, addr, layout)
+    s.set_addressing(question)
+    s.set_payload(payload)
+    s.set_child_ref(child_rel)
+    if layout.extra_bits:
+        s.set_extra(extra)
     return s
 
 
 def step(arena: SeedArena, current: int, rule: AddressingRule) -> int:
-    """One inference step: current bits → next payload bits."""
-    s = lookup(arena, current, rule)
-    return s.payload()
+    return lookup(arena, current, rule).payload()
+
+
+# import numpy only where needed to keep kernels pure
+import numpy as np  # noqa: E402

@@ -1,6 +1,7 @@
 """
-Minimal demonstration of the nested-seed, zero-cost lookup,
-and background self-improvement ideas.
+End-to-end demonstration of pure packed seeds,
+bidirectional addressing, multi-task fitness,
+and self-modifying background improvement.
 """
 
 from __future__ import annotations
@@ -11,34 +12,30 @@ from .addressing import involutive_permute
 
 
 def main():
-    print("=== Seed-Fractal AI demo ===\n")
+    print("=== Seed-Fractal AI — pure optimization demo ===\n")
 
-    rt = Runtime(capacity_mb=8)  # tiny for the demo
+    rt = Runtime(capacity_mb=16, mode="involutive")
 
-    # Teach a few question ↔ answer pairs
-    print("Teaching a handful of associations...")
-    for q in range(0, 100, 7):
+    print("Teaching associations...")
+    for q in range(0, 200, 5):
         a = involutive_permute(q, 16) & 0xFFFF
         rt.teach(q, a)
 
-    # Query
-    print("\nQueries:")
-    for q in [0, 7, 14, 21, 42]:
-        ans = rt.ask(q)
-        print(f"  Q={q:4d} → A={ans:#06x}")
+    print("\nInitial queries:")
+    for q in [0, 5, 10, 15, 42, 100]:
+        print(f"  Q={q:4d} → A={rt.ask(q):#06x}")
 
-    print("\nStarting background self-improvement (daemon)...")
-    rt.start_self_improvement(interval_sec=0.5)
+    print("\nStarting indefinite self-improvement (daemon thread)...")
+    rt.start_self_improvement(interval_sec=0.4)
 
-    # Let it run a few cycles
-    for i in range(8):
-        time.sleep(0.6)
-        print(f"  [{i}] {rt.status()}")
+    for i in range(12):
+        time.sleep(0.5)
+        print(f"  [{i:02d}] {rt.status()}")
 
     rt.stop_self_improvement()
-    print("\nDemo finished.")
-    print(rt.status())
+    print("\nFinal status:", rt.status())
     print(f"Arena footprint: {rt.arena.used_bytes()} bytes")
+    print("Demo complete.")
 
 
 if __name__ == "__main__":

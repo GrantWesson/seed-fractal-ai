@@ -1,75 +1,78 @@
 """
-SeedArena – single contiguous, page-aligned packed bit buffer.
-All seeds live here. No unpacking. Ever.
+SeedArena – single contiguous, perfectly aligned packed-bit buffer.
+
+Design invariants:
+- All permanent state lives in one uint64 array.
+- Allocations are 64-bit aligned.
+- read/write of arbitrary bit fields never materializes temporaries beyond registers.
+- Persistence = dump/load the raw buffer + a tiny header.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from typing import Optional
+from pathlib import Path
+from typing import Optional, BinaryIO
+
+MAGIC = np.uint64(0xSEEDFACA)
+VERSION = np.uint64(2)
 
 
 class SeedArena:
-    """
-    The entire model is one arena of packed bits.
-
-    Memory layout:
-        [ header | seed0 | seed1 | ... | free ]
-
-    Every seed is a fixed or variable-width packed record whose
-    absolute bit-offset is its identity.
-    """
+    __slots__ = ("buf", "n_words", "bit_len", "next_free_bit")
 
     def __init__(self, capacity_bytes: int = 64 * 1024 * 1024):
-        # We work in uint64 words for natural alignment.
-        self.n_words = (capacity_bytes + 7) // 8
+        self.n_words = max(16, (capacity_bytes + 7) // 8)
         self.buf = np.zeros(self.n_words, dtype=np.uint64)
         self.bit_len = self.n_words * 64
-        self.next_free_bit = 0  # bump allocator for new seeds
-
-        # Tiny header: version + root seed offset
+        self.next_free_bit = 128  # leave header space
         self._write_header()
 
     def _write_header(self) -> None:
-        # bits 0..63 : magic + version
-        self.buf[0] = np.uint64(0xSEEDFACA)  # magic
-        # root seed will be placed at a known offset later
+        self.buf[0] = MAGIC
+        self.buf[1] = VERSION
+        self.buf[2] = np.uint64(0)  # root bit-offset
+        self.buf[3] = np.uint64(self.next_free_bit)
 
     @property
     def root_offset(self) -> int:
-        return int(self.buf[1])  # we store root bit-offset in word 1
+        return int(self.buf[2])
 
     @root_offset.setter
     def root_offset(self, bit_off: int) -> None:
-        self.buf[1] = np.uint64(bit_off)
+        self.buf[2] = np.uint64(bit_off)
 
-    def alloc(self, n_bits: int) -> int:
-        """Bump-allocate a packed region. Returns starting bit offset."""
-        # Align to 64-bit boundary for free loads
-        aligned = (self.next_free_bit + 63) & ~63
+    def alloc(self, n_bits: int, align: int = 64) -> int:
+        """Bump-allocate. Returns bit offset aligned to `align`."""
+        assert align & (align - 1) == 0, "align must be power of two"
+        mask = align - 1
+        aligned = (self.next_free_bit + mask) & ~mask
         if aligned + n_bits > self.bit_len:
-            raise MemoryError("SeedArena exhausted")
+            raise MemoryError(
+                f"SeedArena exhausted: need {n_bits} bits, have {self.bit_len - aligned}"
+            )
         self.next_free_bit = aligned + n_bits
+        self.buf[3] = np.uint64(self.next_free_bit)
         return aligned
 
     def read_bits(self, bit_offset: int, n_bits: int) -> int:
-        """Extract up to 64 bits starting at bit_offset. Zero-copy view."""
-        if n_bits > 64:
-            raise ValueError("Use read_bits_wide for >64 bits")
+        """Extract 1..64 bits. Pure shifts + masks."""
+        if not (1 <= n_bits <= 64):
+            raise ValueError("n_bits must be 1..64")
         word_idx = bit_offset >> 6
         shift = bit_offset & 63
+        mask = (1 << n_bits) - 1
         if shift + n_bits <= 64:
-            val = int(self.buf[word_idx]) >> shift
-            return val & ((1 << n_bits) - 1)
-        # Spans two words
+            return (int(self.buf[word_idx]) >> shift) & mask
+        # spans two words
         low = int(self.buf[word_idx]) >> shift
         high = int(self.buf[word_idx + 1]) << (64 - shift)
-        return (low | high) & ((1 << n_bits) - 1)
+        return (low | high) & mask
 
     def write_bits(self, bit_offset: int, n_bits: int, value: int) -> None:
-        """Deposit up to 64 bits. In-place, no temporaries."""
-        if n_bits > 64:
-            raise ValueError("Use write_bits_wide for >64 bits")
+        """Deposit 1..64 bits in place."""
+        if not (1 <= n_bits <= 64):
+            raise ValueError("n_bits must be 1..64")
         mask = (1 << n_bits) - 1
         value &= mask
         word_idx = bit_offset >> 6
@@ -77,30 +80,59 @@ class SeedArena:
         if shift + n_bits <= 64:
             clear = ~np.uint64(mask << shift)
             self.buf[word_idx] = (self.buf[word_idx] & clear) | np.uint64(value << shift)
-        else:
-            # Spans two words – still pure bit ops
-            bits_in_first = 64 - shift
-            low_mask = (1 << bits_in_first) - 1
-            self.buf[word_idx] = (self.buf[word_idx] & ~np.uint64(low_mask << shift)) | np.uint64(
-                (value & low_mask) << shift
-            )
-            high_bits = n_bits - bits_in_first
-            high_mask = (1 << high_bits) - 1
-            self.buf[word_idx + 1] = (self.buf[word_idx + 1] & ~np.uint64(high_mask)) | np.uint64(
-                value >> bits_in_first
-            )
+            return
+        bits_in_first = 64 - shift
+        low_mask = (1 << bits_in_first) - 1
+        self.buf[word_idx] = (
+            self.buf[word_idx] & ~np.uint64(low_mask << shift)
+        ) | np.uint64((value & low_mask) << shift)
+        high_bits = n_bits - bits_in_first
+        high_mask = (1 << high_bits) - 1
+        self.buf[word_idx + 1] = (
+            self.buf[word_idx + 1] & ~np.uint64(high_mask)
+        ) | np.uint64(value >> bits_in_first)
 
-    def load_aligned_word(self, bit_offset: int) -> np.uint64:
-        """Require bit_offset % 64 == 0. Fast path."""
+    def load_aligned(self, bit_offset: int) -> np.uint64:
         assert bit_offset % 64 == 0
         return self.buf[bit_offset >> 6]
 
-    def store_aligned_word(self, bit_offset: int, word: np.uint64) -> None:
+    def store_aligned(self, bit_offset: int, word: np.uint64) -> None:
         assert bit_offset % 64 == 0
         self.buf[bit_offset >> 6] = word
+
+    def used_bits(self) -> int:
+        return int(self.next_free_bit)
 
     def used_bytes(self) -> int:
         return (self.next_free_bit + 7) // 8
 
+    # ---------- persistence (the arena *is* the checkpoint) ----------
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        header = np.array(
+            [MAGIC, VERSION, self.root_offset, self.next_free_bit, self.n_words],
+            dtype=np.uint64,
+        )
+        with path.open("wb") as f:
+            header.tofile(f)
+            self.buf[: self.n_words].tofile(f)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "SeedArena":
+        path = Path(path)
+        with path.open("rb") as f:
+            header = np.fromfile(f, dtype=np.uint64, count=5)
+            if header[0] != MAGIC:
+                raise ValueError("Bad magic")
+            n_words = int(header[4])
+            buf = np.fromfile(f, dtype=np.uint64, count=n_words)
+        arena = cls.__new__(cls)
+        arena.n_words = n_words
+        arena.buf = buf
+        arena.bit_len = n_words * 64
+        arena.next_free_bit = int(header[3])
+        return arena
+
     def __repr__(self) -> str:
-        return f"SeedArena(used={self.used_bytes()} B / {self.n_words * 8} B)"
+        return f"SeedArena(used={self.used_bytes()}B / {self.n_words*8}B, free_bit={self.next_free_bit})"

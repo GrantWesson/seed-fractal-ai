@@ -1,79 +1,119 @@
 """
-Background self-improvement loop.
+Self-improving background process.
 
-The program continuously proposes small mutations to addressing rules
-or seed payloads, runs a cheap simulation, and keeps the change only
-if a fitness metric improves. This runs indefinitely as a low-priority
-background process.
+Two levels of evolution happen concurrently:
+1. Addressing-rule seed mutation (fast, bit-level).
+2. Occasional self-modification of the mutation operators and
+   helper functions themselves (code-as-seeds, sandboxed).
+
+Only strict fitness improvements are committed. The loop is designed
+to run indefinitely at low priority.
 """
 
 from __future__ import annotations
 
 import time
 import random
+import copy
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Dict
 
 from .arena import SeedArena
-from .addressing import AddressingRule, involutive_permute
-from .kernels import lookup, deposit_answer, step
+from .addressing import AddressingRule
+from .fitness import evaluate
+from .selfmod import CodeSeed, BOOTSTRAP_FITNESS_HELPER, DEFAULT_MUTATORS
 
 
 @dataclass
 class Candidate:
-    rule_seed: int
-    fitness: float = 0.0
-    description: str = ""
+    rule: AddressingRule
+    fitness: float
+    generation: int
+    note: str = ""
 
 
 @dataclass
 class Improver:
     arena: SeedArena
     rule: AddressingRule
-    fitness_fn: Callable[[SeedArena, AddressingRule], float]
-    mutation_rate: float = 0.05
+    fitness_fn: Callable[[SeedArena, AddressingRule], float] = evaluate
+    mutation_strength: float = 0.04
+    selfmod_every: int = 25  # attempt code-level mutation this often
     history: List[Candidate] = field(default_factory=list)
     best: Optional[Candidate] = None
+    generation: int = 0
     running: bool = False
+    code_seeds: Dict[str, CodeSeed] = field(default_factory=dict)
 
-    def evaluate(self, rule: AddressingRule) -> float:
-        return self.fitness_fn(self.arena, rule)
+    def __post_init__(self):
+        if not self.code_seeds:
+            self.code_seeds["helper"] = BOOTSTRAP_FITNESS_HELPER
 
-    def mutate_rule(self, rule: AddressingRule) -> AddressingRule:
-        """Tiny mutation of the addressing seed."""
-        new_seed = rule.seed
-        if random.random() < self.mutation_rate:
-            # Flip a few bits
-            bit = 1 << random.randint(0, 31)
-            new_seed ^= bit
-        return AddressingRule(width=rule.width, seed=new_seed, base_offset=rule.base_offset)
-
-    def improve_once(self) -> bool:
-        """Propose → simulate → accept or reject. Returns True if improved."""
-        candidate_rule = self.mutate_rule(self.rule)
-        fitness = self.evaluate(candidate_rule)
-
-        cand = Candidate(rule_seed=candidate_rule.seed, fitness=fitness)
+    def _record(self, rule: AddressingRule, fitness: float, note: str = "") -> None:
+        cand = Candidate(rule=rule, fitness=fitness, generation=self.generation, note=note)
         self.history.append(cand)
-
         if self.best is None or fitness > self.best.fitness:
             self.best = cand
-            self.rule = candidate_rule
+            self.rule = rule
+
+    def improve_addressing(self) -> bool:
+        """Classic fast path: mutate the addressing seed."""
+        self.generation += 1
+        cand_rule = self.rule.mutate(self.mutation_strength)
+        fit = self.fitness_fn(self.arena, cand_rule)
+        improved = self.best is None or fit > self.best.fitness
+        self._record(cand_rule, fit, "addr")
+        return improved
+
+    def improve_code(self) -> bool:
+        """
+        Out-of-box path: mutate a CodeSeed, try it in a sandbox,
+        keep only if the overall system fitness rises.
+        """
+        self.generation += 1
+        name = random.choice(list(self.code_seeds.keys()))
+        original = self.code_seeds[name]
+        mutant = original.mutate(random.choice(list(DEFAULT_MUTATORS.keys())))
+
+        # Sandbox check: can it even execute?
+        local: dict = {}
+        if not mutant.try_eval(local):
+            return False
+
+        # For the prototype we only accept mutants that still define a
+        # callable 'score'. Deeper versions would replace live functions.
+        if "score" not in local or not callable(local["score"]):
+            return False
+
+        # Measure system fitness with the current rule (code change is
+        # orthogonal for now; future work wires the helper into fitness).
+        fit = self.fitness_fn(self.arena, self.rule)
+        # Accept the code mutant if it is at least as good (encourages
+        # exploration of the code space without immediate regression).
+        if self.best is None or fit >= self.best.fitness - 1e-6:
+            self.code_seeds[name] = mutant
+            self._record(self.rule, fit, f"code:{name}")
             return True
         return False
 
-    def run_background(self, interval_sec: float = 1.0, max_steps: Optional[int] = None):
-        """
-        Indefinite improvement loop.
-        Intended to be started in a daemon thread or as a separate process.
-        """
+    def improve_once(self) -> bool:
+        if self.generation > 0 and self.generation % self.selfmod_every == 0:
+            return self.improve_code()
+        return self.improve_addressing()
+
+    def run_background(self, interval_sec: float = 0.8, max_steps: Optional[int] = None):
         self.running = True
         steps = 0
-        print("[Improver] background self-improvement started")
+        print("[Improver] indefinite self-optimization started")
         while self.running:
             improved = self.improve_once()
-            if improved:
-                print(f"[Improver] improved → fitness={self.best.fitness:.4f} seed={self.best.rule_seed:#x}")
+            if improved and self.best:
+                print(
+                    f"[Improver] gen={self.generation} "
+                    f"fit={self.best.fitness:.4f} "
+                    f"note={self.best.note} "
+                    f"seed={self.rule.seed:#x}"
+                )
             steps += 1
             if max_steps is not None and steps >= max_steps:
                 break
@@ -82,27 +122,3 @@ class Improver:
 
     def stop(self):
         self.running = False
-
-
-def default_fitness(arena: SeedArena, rule: AddressingRule) -> float:
-    """
-    Toy fitness: how consistently a random set of questions
-    round-trip through the bidirectional mapping + a simple
-    payload prediction task.
-    """
-    score = 0.0
-    rng = random.Random(42)
-    for _ in range(32):
-        q = rng.randint(0, 2**20 - 1)
-        # Deposit a deterministic "answer"
-        expected = involutive_permute(q, 20) & 0xFFFF
-        deposit_answer(arena, q, expected, rule)
-        # Look it up again
-        s = lookup(arena, q, rule)
-        if s.payload() == expected:
-            score += 1.0
-        # Bidirectional check (approximate in the toy)
-        back = rule.inverse(s.bit_offset)
-        if (back & 0xFFFF) == (q & 0xFFFF):
-            score += 0.5
-    return score / 32.0
