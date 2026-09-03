@@ -1,28 +1,22 @@
 # Seed-Fractal AI
 
-**Pure unadulterated optimization.**  
-Nested bidirectional seeds · Zero unpack · Zero data-dependent branches · Zero pointer-chasing cache misses · Self-modifying forever.
+**Target: ≤ 512 MB (hard ceiling 2048 MB).**  
+Pure packed bits · Zero unpack · Zero data-dependent branches · Zero pointer-chasing · Self-modifying representation.
 
-The model is a single contiguous, perfectly aligned packed-bit arena of seeds-within-seeds.
+The entire model is one contiguous aligned arena of nested seeds.
 
-- Question bits **are** the address of the answer seed.
-- Answer points back (involution / holographic binding).
-- No expansion, no materialization, no temporary unpacked values.
-- Hot kernels are straight-line: both sides of every former `if` are computed, then selected with a mask.
-- One contiguous arena → maximal spatial locality.
-- Power-of-two allocation units so indexing collapses to shifts.
-- The system rewrites its own functions (including the operators that produce branchless code) by treating code as seeds and keeping only measured improvements.
+## Core optimisations (all active)
 
-Target: useful general capability inside **≤ 2048 MiB**.
-
-## Principles
-
-1. Never unpack.
-2. Never branch on data – arithmetic select / mask blend only.
-3. Never chase pointers across cache lines – everything is an offset into one array.
-4. Addressing is pure bit computation.
-5. Code is data is seeds – the improver evolves its own mutation operators toward branchless forms.
-6. Simulation before commit.
+1. **Variable bit-width regions** – 1/2/4/8/16/32-bit seeds mixed in the same arena. Improver chooses width by fitness-per-bit.
+2. **Prototype / shared seeds** – common payloads and sub-trees live once; ordinary seeds store only a short reference + optional delta.
+3. **Holographic multi-pair seeds** – one physical seed can bind several question–answer pairs via XOR/binding; retrieval is unbinding.
+4. **Size-penalized fitness** – `score / (used_MB + ε)` so the improver is directly pressured under 512 MB.
+5. **Hot/cold reordering** – frequently used seeds are moved to low addresses (still pure offsets).
+6. **Representation self-modification** – the improver mutates bit-widths, prototype tables, binding depth and addressing parameters.
+7. **Branchless + power-of-two** layouts and mask-select kernels.
+8. **Streaming inference** – activations never materialise; each payload is consumed by the next addressing step.
+9. **Low-bit C reference kernels** for 1/2/4/8-bit fields.
+10. **Single-arena persistence** with structure that admits future seed-aware compression.
 
 ## Quick Start
 
@@ -35,37 +29,34 @@ python -m seedfractal.demo
 
 ## Native kernels
 
-A reference branch-free C implementation lives in `native/`:
-
 ```bash
 gcc -O3 -march=native -o seed_kernels_test native/seed_kernels.c
 perf stat -e cache-references,cache-misses,branches,branch-misses ./seed_kernels_test
 ```
 
-See `native/README.md`.
-
 ## Layout
 
 ```
 seedfractal/
-  branchless.py     # pure arithmetic select / align / masks
-  arena.py          # contiguous buffer, branchless read/write
-  seed.py           # power-of-two hierarchical Seed
-  addressing.py     # involutive + holographic
-  kernels.py        # straight-line lookup / deposit / step
-  fitness.py
-  improver.py       # evolves addressing *and* branchless code seeds
-  selfmod.py        # code-as-seeds + branchless-oriented mutators
+  branchless.py
+  arena.py          # contiguous buffer, variable-width support
+  seed.py           # power-of-two + variable logical widths
+  prototype.py      # shared prototype table
+  addressing.py     # involutive + holographic + perfect-hash style
+  kernels.py        # streaming lookup / deposit / step
+  fitness.py        # multi-task + size penalty
+  improver.py       # evolves code *and* representation
+  selfmod.py
   runtime.py
   demo.py
 native/
-  seed_kernels.c    # C reference, provably low-branch
+  seed_kernels.c    # branch-free, low-bit capable
   README.md
 ```
 
 ## Status
 
-Research prototype. Python is the executable specification; the C kernels show the intended zero-branch, cache-friendly lowering.
+Research prototype aggressively optimised for density. The improver now treats bytes used as a first-class cost.
 
 ## License
 

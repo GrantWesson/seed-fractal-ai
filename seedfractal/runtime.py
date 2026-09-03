@@ -1,5 +1,5 @@
 """
-Runtime orchestrator.
+Runtime with prototype table, variable layouts and density reporting.
 """
 
 from __future__ import annotations
@@ -11,22 +11,27 @@ from typing import Optional
 from .arena import SeedArena
 from .addressing import AddressingRule
 from .improver import Improver
-from .kernels import deposit, step, lookup
+from .kernels import deposit, step, resolve
+from .prototype import PrototypeTable
 from .fitness import evaluate
+from .seed import DEFAULT_LAYOUT
 
 
 class Runtime:
-    def __init__(self, capacity_mb: int = 32, mode: str = "involutive"):
+    def __init__(self, capacity_mb: int = 64, mode: str = "involutive"):
         self.arena = SeedArena(capacity_bytes=capacity_mb * 1024 * 1024)
-        self.rule = AddressingRule(mode=mode)
+        self.rule = AddressingRule(mode=mode, span_bits=18)
+        self.protos = PrototypeTable(capacity=128)
+        self.protos.bind(self.arena)
         self.improver = Improver(
             arena=self.arena,
             rule=self.rule,
+            protos=self.protos,
             fitness_fn=evaluate,
         )
         self._bg: Optional[threading.Thread] = None
 
-    def start_self_improvement(self, interval_sec: float = 1.0):
+    def start_self_improvement(self, interval_sec: float = 0.8):
         if self._bg and self._bg.is_alive():
             return
         self._bg = threading.Thread(
@@ -43,23 +48,25 @@ class Runtime:
             self._bg.join(timeout=2.0)
 
     def teach(self, question: int, answer: int):
-        deposit(self.arena, question, answer, self.rule)
+        deposit(self.arena, question, answer, self.rule, layout=self.improver.current_layout)
 
     def ask(self, question: int) -> int:
-        return step(self.arena, question, self.rule)
+        return resolve(self.arena, question, self.rule, self.protos)
 
     def save(self, path: str | Path):
         self.arena.save(path)
 
     def load(self, path: str | Path):
         self.arena = SeedArena.load(path)
-        # rule seed is not yet persisted in header; future work
+        self.protos.bind(self.arena)
 
     def status(self) -> str:
         b = self.improver.best
         fit = f"{b.fitness:.4f}" if b else "n/a"
+        used = self.arena.used_bytes()
         return (
-            f"Runtime(used={self.arena.used_bytes()}B, "
-            f"gen={self.improver.generation}, "
-            f"best={fit}, rule={self.rule.seed:#x}, mode={self.rule.mode})"
+            f"Runtime(used={used}B ({used/1024/1024:.3f} MB), "
+            f"gen={self.improver.generation}, best={fit}, "
+            f"layout={self.improver.current_layout.total_bits}b, "
+            f"protos={len(self.protos)})"
         )

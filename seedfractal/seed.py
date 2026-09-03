@@ -1,9 +1,8 @@
 """
-Power-of-two hierarchical Seed.
+Variable-width hierarchical Seed with prototype support.
 
-All layouts are forced to power-of-two total bit width.
-Offsets are pure shifts. No residual data-dependent Python
-conditionals in the accessors themselves.
+Logical field widths can be 1/2/4/8/16/32.
+Allocation unit is the next power-of-two.
 """
 
 from __future__ import annotations
@@ -15,27 +14,22 @@ if TYPE_CHECKING:
     from .arena import SeedArena
 
 
-def _is_pow2(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
+def _next_pow2(x: int) -> int:
+    if x <= 0:
+        return 1
+    return 1 << (x - 1).bit_length()
 
 
 @dataclass(slots=True, frozen=True)
 class SeedLayout:
-    addressing_bits: int = 32
-    payload_bits: int = 32
-    child_ref_bits: int = 32
-    extra_bits: int = 0
+    addressing_bits: int = 16
+    payload_bits: int = 16
+    child_ref_bits: int = 16
+    extra_bits: int = 0          # can hold prototype index or holographic state
 
     def __post_init__(self):
         total = self.total_bits
-        # Force power-of-two by construction for the default path.
-        # Callers that need non-pow2 must go through a padding allocator.
-        if not _is_pow2(total):
-            # Round up to next power of two for allocation size;
-            # logical fields stay as declared.
-            object.__setattr__(self, "_alloc_bits", 1 << (total - 1).bit_length())
-        else:
-            object.__setattr__(self, "_alloc_bits", total)
+        object.__setattr__(self, "_alloc_bits", _next_pow2(max(total, 8)))
 
     @property
     def total_bits(self) -> int:
@@ -48,7 +42,7 @@ class SeedLayout:
 
     @property
     def alloc_bits(self) -> int:
-        return getattr(self, "_alloc_bits", self.total_bits)
+        return getattr(self, "_alloc_bits", _next_pow2(self.total_bits))
 
     def pack(self) -> int:
         return (
@@ -68,8 +62,12 @@ class SeedLayout:
         )
 
 
-# 128-bit allocation unit (power of two). Logical fields sum to 96.
-DEFAULT_LAYOUT = SeedLayout(32, 32, 32, 0)
+# Dense default: 16+16+16 = 48 logical → 64-bit allocation
+DEFAULT_LAYOUT = SeedLayout(16, 16, 16, 0)
+# Ultra-dense for bulk knowledge
+TINY_LAYOUT = SeedLayout(8, 8, 8, 0)
+# Prototype reference layout (small index in extra)
+PROTO_LAYOUT = SeedLayout(12, 12, 12, 8)
 
 
 class Seed:
@@ -84,8 +82,6 @@ class Seed:
         self.arena = arena
         self.bit_offset = bit_offset
         self.layout = layout
-
-    # ---- pure offset arithmetic (constants fold) ----
 
     def addressing(self) -> int:
         return self.arena.read_bits(self.bit_offset, self.layout.addressing_bits)
@@ -110,17 +106,19 @@ class Seed:
         self.arena.write_bits(off, self.layout.child_ref_bits, relative)
 
     def extra(self) -> int:
+        if self.layout.extra_bits == 0:
+            return 0
         off = (
             self.bit_offset
             + self.layout.addressing_bits
             + self.layout.payload_bits
             + self.layout.child_ref_bits
         )
-        # When extra_bits == 0 the read is defined to return 0 via mask
-        return self.arena.read_bits(off, max(1, self.layout.extra_bits)) & ((1 << self.layout.extra_bits) - 1 if self.layout.extra_bits else 0)
+        return self.arena.read_bits(off, self.layout.extra_bits)
 
     def set_extra(self, v: int) -> None:
-        # Caller responsibility: only call when extra_bits > 0
+        if self.layout.extra_bits == 0:
+            return
         off = (
             self.bit_offset
             + self.layout.addressing_bits
@@ -130,27 +128,17 @@ class Seed:
         self.arena.write_bits(off, self.layout.extra_bits, v)
 
     def child(self) -> "Seed | None":
-        """
-        Returns a Seed or None.
-        In the C lowering this becomes a sentinel offset (0) test that
-        is turned into a predicated move / blend, not a hard branch.
-        """
         rel = self.child_ref()
-        # Single comparison; the common case in tight loops is non-zero
-        # and modern predictors handle it. For fully branch-free C we
-        # return a dummy Seed at offset 0 and let the caller mask.
         if rel == 0:
             return None
         return Seed(self.arena, self.bit_offset + rel, self.layout)
 
     def child_offset(self) -> int:
-        """Branch-free alternative: returns absolute offset or 0."""
         rel = self.child_ref()
-        # Arithmetic select would be used in C; here we keep clarity
         return (self.bit_offset + rel) * (rel != 0)
 
     def __repr__(self) -> str:
         return (
-            f"Seed(@{self.bit_offset}, addr={self.addressing():#x}, "
-            f"pay={self.payload():#x}, child={self.child_ref()})"
+            f"Seed(@{self.bit_offset}, w={self.layout.total_bits}b, "
+            f"addr={self.addressing():#x}, pay={self.payload():#x})"
         )
